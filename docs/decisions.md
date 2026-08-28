@@ -75,3 +75,29 @@ Null rates all land where expected: lag_28/roll_* null only for the first
 null for series younger than a year (23.95%); event_type_1 null on the
 ~92% of days with no event (correct — most days have no holiday/event).
 No feature was imputed with zero; LightGBM handles nulls natively (M4).
+
+## 2026-08-28 — Entry 4: Metrics, baselines, backtest harness (M3)
+
+Built `metrics.py` (RMSSE, weighted RMSSE, MAE, bias, pinball loss),
+`baselines.py` (naive, seasonal_naive_7, mean_28, croston_lite — all
+horizon-legal, built from already-shifted SQL features), and
+`backtest.py` (3-fold rolling-origin harness, train window = trailing 730
+days, test window = 28 days after each origin, weights = dollar sales in
+the last 28 days of train). `tests/test_metrics.py` (9 tests) and
+`tests/test_splits.py` (2 tests) both pass; the RMSSE-of-naive-on-training-
+tail sanity check lands at ~0.9-1.1 as required.
+
+Baseline backtest results (3-fold mean, weighted RMSSE):
+naive=1.066, seasonal_naive_7=1.084, mean_28=0.829, croston_lite=0.895.
+`mean_28` is the strongest baseline, as the spec anticipated — noted
+honestly in `reports/results.md` rather than picking a weaker comparison
+to make M4's model look better. `croston_lite` carries a strong positive
+bias (+0.857): it forecasts average non-zero-event size without
+discounting for zero-days, so it over-forecasts intermittent series
+structurally, not as a bug.
+
+Correctness note worth flagging: `seasonal_naive_7` is implemented as
+`lag_35` (28+7), not `lag_7`. `lag_7` would reach inside the 28-day
+forecast horizon and would not be horizon-legal — at forecast time we only
+know data through `t-1`, so "same weekday last week" has to be measured
+from the most recent horizon-legal anchor (`t-28`), not from `t` itself.

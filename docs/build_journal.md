@@ -686,3 +686,209 @@ handles missing values natively by learning a default split direction for
 them, so leaving it null is both more honest and requires no extra code.
 
 ---
+
+## M3 — Metrics, baselines, backtest harness
+
+### What was built
+
+- `src/shelfsense/metrics.py` — `rmsse`, `weighted_rmsse`, `mae`, `bias`,
+  `pinball_loss`
+- `src/shelfsense/baselines.py` — `naive`, `seasonal_naive_7`, `mean_28`,
+  `croston_lite`, all reading directly from already-shifted SQL features
+  (no re-implementing the leakage shift in Python)
+- `src/shelfsense/backtest.py` — 3-fold rolling-origin harness with a
+  `python -m shelfsense.backtest --model <name>` CLI
+- `tests/test_metrics.py` (9 tests), `tests/test_splits.py` (2 tests)
+- `reports/results.md` — the baseline results table
+
+### Code
+
+`src/shelfsense/metrics.py` (the two metrics with the most interview
+surface area):
+```python
+def rmsse(y_true: np.ndarray, y_pred: np.ndarray, y_train: np.ndarray) -> float:
+    """Root Mean Squared Scaled Error for one series.
+
+    The denominator is the in-sample one-step naive error on the TRAINING
+    window only (never the full history) -- using the full history would
+    let the denominator see data from inside the test fold, inflating the
+    apparent improvement.
+    """
+    y_train = np.asarray(y_train, dtype=float)
+    naive_diffs = np.diff(y_train)
+    denom = np.mean(naive_diffs**2)
+    if denom == 0:
+        return np.nan
+    num = np.mean((np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)) ** 2)
+    return float(np.sqrt(num / denom))
+
+
+def weighted_rmsse(rmsse_per_series: pd.Series, weights: pd.Series) -> float:
+    """Dollar-weighted mean of per-series RMSSE. weights = each series'
+    dollar sales in the last 28 days of the training window."""
+    aligned = pd.DataFrame({"rmsse": rmsse_per_series, "weight": weights}).dropna()
+    if aligned["weight"].sum() == 0:
+        return np.nan
+    return float(np.average(aligned["rmsse"], weights=aligned["weight"]))
+```
+
+`src/shelfsense/baselines.py` (the horizon-legal `seasonal_naive_7`):
+```python
+def naive(df: pd.DataFrame) -> pd.Series:
+    """Last observed value. Horizon-legal because it's exactly lag_28 --
+    the most recent value known at forecast time for a 28-day-ahead
+    forecast is the value 28 days back, not "yesterday"."""
+    return df["lag_28"]
+
+
+def seasonal_naive_7(df: pd.DataFrame) -> pd.Series:
+    """Same weekday last week, but taken from lag_35 (28 + 7), not lag_7.
+    lag_7 would use data from inside the forecast horizon and is not
+    horizon-legal for a 28-day-ahead forecast; lag_35 is the freshest
+    "one week before the most recent horizon-legal day" value available."""
+    return df["lag_35"]
+
+
+def croston_lite(df: pd.DataFrame) -> pd.Series:
+    """Croston-style intermittent-demand forecast: the average SIZE of a
+    non-zero demand event, over the horizon-legal trailing 28-day window.
+    roll_mean_28 already equals mean_nonzero_size * nonzero_rate (zeros
+    contribute nothing to the sum), so dividing it back out by the
+    nonzero rate recovers the average non-zero demand size."""
+    nonzero_rate = 1 - df["roll_zero_share_28"]
+    return df["roll_mean_28"] / nonzero_rate.replace(0, pd.NA)
+```
+
+`src/shelfsense/backtest.py` (fold construction — the part a reviewer
+checks first for leakage):
+```python
+def run_fold(con, config, origin_d, model_name):
+    origin_date = _origin_date(con, origin_d)
+    train_start = origin_date - pd.Timedelta(days=config.train_days - 1)
+    test_start = origin_date + pd.Timedelta(days=1)
+    test_end = origin_date + pd.Timedelta(days=config.horizon)
+    weight_start = origin_date - pd.Timedelta(days=config.horizon - 1)
+
+    train_df = con.execute(
+        "SELECT id, date, units FROM feature_matrix WHERE date BETWEEN ? AND ?",
+        [train_start.date(), origin_date.date()],
+    ).df()
+    test_df = con.execute(
+        "SELECT id, date, units, lag_28, lag_35, roll_mean_28, roll_zero_share_28 "
+        "FROM feature_matrix WHERE date BETWEEN ? AND ?",
+        [test_start.date(), test_end.date()],
+    ).df()
+    # RMSSE denominator computed from train_df only, per series,
+    # via a pre-grouped dict (not a per-series DataFrame rescan)
+    train_by_id = {sid: g["units"].to_numpy() for sid, g in train_df.groupby("id", sort=False)}
+    ...
+```
+
+### Verification result
+
+```
+tests/test_metrics.py: 9 passed
+  including: RMSSE of a perfect forecast = 0.0
+             RMSSE of naive-on-training-tail ~= 1.0 (measured: within [0.9, 1.1])
+tests/test_splits.py: 2 passed
+  max(train date) < min(test date) for every configured fold, checked
+  against real calendar-joined dates pulled from the warehouse -- not just
+  arithmetic on day-index integers
+
+python -m shelfsense.backtest --model seasonal_naive_7: runs all 3 folds in ~17s
+
+3-fold mean weighted RMSSE:
+  naive             1.066
+  seasonal_naive_7  1.084
+  mean_28           0.829   <- strongest baseline, as the spec predicted
+  croston_lite      0.895   (bias +0.857 -- structurally over-forecasts)
+```
+
+### Design decisions
+
+**RMSSE denominator computed per-fold from the training window only, never
+the full series history.** The spec calls this out explicitly as a gotcha,
+and it's easy to get backwards: using the full history (which includes the
+test period) lets the denominator "see" the same volatility the numerator
+is being scored against, which can inflate or deflate the apparent
+improvement depending on how the test period's volatility compares to the
+full history's. Scoping the denominator strictly to `train_df` for that
+fold keeps every fold's score computed from information that would have
+actually been available at that origin.
+
+**`seasonal_naive_7` implemented as `lag_35`, not `lag_7`.** This is the
+single easiest mistake to make in this milestone: "same weekday last week"
+sounds like `lag_7`, but at forecast time `t` we only know sales through
+`t-1`, and this project's horizon is 28 days — so the freshest anchor point
+horizon-legal for *any* feature is `t-28`. "One week before the most recent
+legal anchor" is `t-28-7 = t-35`. Using `lag_7` here would be leaking the
+exact same way an unshifted rolling feature would, just dressed up as a
+baseline instead of a model feature.
+
+**Baselines read straight from already-computed SQL columns
+(`lag_28`, `lag_35`, `roll_mean_28`, `roll_zero_share_28`) instead of
+recomputing shifts in Python.** This isn't just less code — it means the
+leakage-safety of the baselines is inherited from the same tested,
+reviewed SQL as the model features, rather than depending on a second,
+independent implementation of the same t-28 shift rule that could drift
+out of sync or be implemented slightly differently (off-by-one, wrong
+frame boundary) without either version raising an error.
+
+**`croston_lite`'s positive bias reported as-is, not investigated away.**
+The methodologically honest baseline for an intermittent-demand series
+forecasts the average *size* of a demand event, which is necessarily
+larger than the actual per-day mean once you account for zero-days. That's
+not a bug to fix, it's what a naive Croston-style forecast structurally
+does when demand is intermittent — the point of reporting bias alongside
+RMSSE is exactly to surface this kind of systematic error a pure accuracy
+metric would understate.
+
+**Fold-vs-fold table reported honestly, including that `mean_28` beats
+both naive variants.** The spec predicted this outcome and asked for
+honesty about it rather than picking whichever baseline makes the eventual
+LightGBM model look best by comparison. `reports/results.md` states
+`mean_28`'s weighted RMSSE (0.829) as the actual bar M4 needs to clear.
+
+### Interview questions this milestone should prepare you for
+
+**Q: Walk me through the RMSSE formula and why the denominator matters.**
+A: `RMSSE = sqrt(mean((y - yhat)^2) / mean(diff(y_train)^2))`. The
+numerator is the model's squared error on the test window; the denominator
+is the in-sample one-step naive error computed from the *training* window
+only. Dividing by that denominator is what makes the metric *scaled* — a
+model that's off by 2 units/day on an item that sells 2 units/day is a
+much worse model than one that's off by 2 units/day on an item that sells
+200/day, and RMSSE reflects that by normalizing against how volatile the
+series naturally is. Using the training window (not the full series) for
+the denominator keeps the metric honest to what was actually knowable at
+that forecast origin.
+
+**Q: Your baseline (`mean_28`) is close to your model on some segments —
+why keep the model?**
+A: Two reasons, and I'd rather answer with the actual numbers than dodge
+the question. First, weighted RMSSE is dollar-weighted, so a baseline that
+does fine in aggregate can still be materially worse on the highest-revenue
+segments, which is where the cost-of-error result in M5 actually matters.
+Second, `mean_28` can't use price, calendar, SNAP, or event information at
+all — it has no way to react to a known upcoming holiday or a planned price
+change, which a category manager explicitly cares about. If the aggregate
+gap were genuinely small, that's a legitimate finding to report honestly,
+not something to paper over.
+
+**Q: How did you validate your backtest splits don't leak?**
+A: `test_splits.py` pulls the actual calendar-joined dates for the train
+and test windows of every configured fold from the warehouse and asserts
+`max(train date) < min(test date)`. Checking against real dates, not just
+day-index arithmetic, means a bug in the calendar join itself — not just a
+bug in the fold-boundary math — would also be caught.
+
+**Q: Why three folds instead of one train/test split?**
+A: A single split only tells you the model works for that one specific
+28-day window, which could be unusually easy or hard (a holiday period, an
+anomalous month). Three rolling-origin folds, each an independent 28-day
+block from `d_1857` through `d_1941`, tell you whether performance is
+stable across different periods — and if fold-to-fold variance is large,
+that's itself a finding worth reporting, not something a single split
+could ever surface.
+
+---
