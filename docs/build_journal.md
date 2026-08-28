@@ -212,3 +212,240 @@ truncated or mis-downloaded file at this stage is cheap; catching it after
 building a feature matrix on top of it is not.
 
 ---
+
+## M1 — DuckDB warehouse: wide → long
+
+### What was built
+
+- `sql/01_load_raw.sql` — loads all four CSVs into raw DuckDB tables with
+  `read_csv_auto`, no transformation
+- `sql/02_sales_long.sql` — unpivots `d_1…d_1941` into long format, filters
+  to the configured store/dept scope, joins calendar and prices, trims each
+  series' pre-launch leading zero-run, and materializes the result as
+  `sales_long`
+- `src/shelfsense/warehouse.py` — runs the SQL files in order against a
+  DuckDB file, substituting `{stores}`/`{depts}` placeholders from
+  `config.yaml` before execution
+
+### Code
+
+`sql/02_sales_long.sql` (the core of M1):
+```sql
+-- Wide-to-long unpivot of raw_sales, scoped to the configured stores/depts,
+-- joined to calendar (date, week key) and prices (weekly, per store-item),
+-- with the pre-launch leading zero-run trimmed off each series.
+
+CREATE OR REPLACE TABLE sales_scoped AS
+UNPIVOT raw_sales
+ON COLUMNS(* EXCLUDE (id, item_id, dept_id, cat_id, store_id, state_id))
+INTO
+    NAME d
+    VALUE units
+;
+
+-- {stores} / {depts} are substituted by warehouse.py from config.yaml
+-- before this file is run (config values, not user input).
+CREATE OR REPLACE TABLE sales_scoped AS
+SELECT *
+FROM sales_scoped
+WHERE store_id IN ({stores})
+  AND dept_id IN ({depts})
+;
+
+CREATE OR REPLACE TABLE sales_with_calendar AS
+SELECT
+    s.id, s.item_id, s.dept_id, s.cat_id, s.store_id, s.state_id,
+    s.d, s.units,
+    c.date, c.wm_yr_wk, c.wday, c.month, c.year,
+    c.event_name_1, c.event_type_1, c.event_name_2, c.event_type_2,
+    c.snap_CA, c.snap_TX, c.snap_WI
+FROM sales_scoped s
+JOIN raw_calendar c ON s.d = c.d
+;
+
+-- LEFT JOIN, not INNER: a missing price row means "not yet stocked", and
+-- that's handled explicitly by the first-sale trim below, not by silently
+-- dropping rows via join semantics.
+CREATE OR REPLACE TABLE sales_with_price AS
+SELECT swc.*, p.sell_price
+FROM sales_with_calendar swc
+LEFT JOIN raw_prices p
+    ON swc.store_id = p.store_id
+   AND swc.item_id = p.item_id
+   AND swc.wm_yr_wk = p.wm_yr_wk
+;
+
+CREATE OR REPLACE TABLE first_sale AS
+SELECT id, MIN(date) AS first_sale_date
+FROM sales_with_price
+WHERE units > 0
+GROUP BY id
+;
+
+CREATE OR REPLACE TABLE sales_long AS
+SELECT swp.*
+FROM sales_with_price swp
+JOIN first_sale fs ON swp.id = fs.id
+WHERE swp.date >= fs.first_sale_date
+;
+```
+
+`src/shelfsense/warehouse.py`:
+```python
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import duckdb
+
+from shelfsense.config import Config, load_config
+
+SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
+SQL_FILES = ["01_load_raw.sql", "02_sales_long.sql"]
+
+
+def _quoted_list(values: list[str]) -> str:
+    return ", ".join(f"'{v}'" for v in values)
+
+
+def build(config: Config | None = None) -> None:
+    config = config or load_config()
+    con = duckdb.connect(config.db_path)
+    for fname in SQL_FILES:
+        sql = (SQL_DIR / fname).read_text()
+        sql = sql.format(
+            stores=_quoted_list(config.stores),
+            depts=_quoted_list(config.depts),
+        )
+        start = time.time()
+        con.execute(sql)
+        print(f"{fname}: {time.time() - start:.1f}s")
+    con.close()
+```
+
+### Verification result
+
+```
+build time: 01_load_raw.sql 7.4s, 02_sales_long.sql 87.2s (total ~95s, under the 2-min bar)
+distinct ids: 4065  (1355 items x 3 stores, matches spec's "~4,000" estimate exactly)
+date range: 2011-01-29 -> 2016-05-22
+null price rows after trim: 0
+per-store volumes:
+  CA_3: 1355 items, 7,839,280 units
+  TX_1: 1355 items, 3,993,233 units
+  WI_2: 1355 items, 4,454,500 units
+```
+
+### A spec discrepancy worth naming (M1 DoD item 1)
+
+MILESTONES.md's M1 "definition of done" says `sales_long` should span
+"2011-01-29 → 2016-06-19". That end date is the last row of
+`calendar.csv` (1,969 days total), not the last day with actual sales.
+`sales_train_evaluation.csv` only has sales columns through `d_1941`, which
+`raw_calendar` maps to **2016-05-22** — the calendar table simply extends 28
+days further (through `d_1969` / 2016-06-19) because those extra days carry
+the calendar/price/SNAP features the model needs to *predict against* for
+the final forecast horizon; there is no sales ground truth for them at all
+(that's the whole reason d_1942…d_1969 exist — they're the target window,
+not additional training days). I did not change anything to force a match —
+`sales_long` correctly ends at 2016-05-22, and the spec's DoD text was
+imprecise about which table's date range it meant. Flagging this rather
+than quietly "fixing" it, per the project's own honesty rule.
+
+### Design decisions
+
+**`UNPIVOT ... ON COLUMNS(* EXCLUDE (...))` instead of a generated `UNION
+ALL`.** DuckDB's native `UNPIVOT` with a `COLUMNS()` expression selects all
+1941 `d_*` columns by exclusion, so the file never hardcodes a 1941-item
+column list. Rejected alternative: generate a giant `UNION ALL` in Python
+and inline it — works, but produces a SQL file nobody could read or review,
+which directly conflicts with the "SQL is a first-class deliverable, write
+it to be read" constraint.
+
+**Scope filter applied as a second `CREATE OR REPLACE TABLE` immediately
+after the unpivot, not fused into one statement.** DuckDB's `UNPIVOT`
+statement doesn't accept a trailing `WHERE` clause in the same statement.
+Splitting it into two materializations costs a small amount of I/O but
+keeps each statement doing one clearly-named thing — easier to explain line
+by line in an interview than a single dense statement mixing unpivot and
+filter logic.
+
+**`{stores}` / `{depts}` as Python string-template substitution, not DuckDB
+prepared-statement parameters.** DuckDB's `execute(sql, params)` binds
+parameters to a *single* statement; `warehouse.py` runs whole multi-statement
+`.sql` files as scripts, where that binding doesn't apply. Since the values
+being substituted come from `config.yaml` (a trusted local file), not
+user input, plain `str.format()` is safe here and avoids restructuring every
+SQL file into one-statement-per-call. This would be the wrong call if
+`stores`/`depts` ever came from an HTTP request or CLI arg passed through
+from an untrusted source — worth saying explicitly if asked about SQL
+injection risk.
+
+**`LEFT JOIN` to `raw_prices`, with the "not yet stocked" case handled
+explicitly by the first-sale trim, not implicitly by the join type.** An
+`INNER JOIN` would also drop unstocked-period rows, but it would silently
+conflate "no price because not yet stocked" with "no price for some other
+data-quality reason" — both vanish the same way, with no signal that
+they're different situations. Doing the trim explicitly via
+`first_sale_date` after a `LEFT JOIN` means a genuinely unexpected missing
+price (mid-life, not pre-launch) would surface as a `NULL` in `sell_price`
+post-trim, which the DoD check (`sell_price IS NULL` count) is specifically
+designed to catch.
+
+### Interview questions this milestone should prepare you for
+
+**Q: Write me the DuckDB unpivot you used for the wide-to-long conversion.**
+A:
+```sql
+UNPIVOT raw_sales
+ON COLUMNS(* EXCLUDE (id, item_id, dept_id, cat_id, store_id, state_id))
+INTO NAME d VALUE units
+```
+`COLUMNS(* EXCLUDE (...))` selects every `d_1`…`d_1941` column by excluding
+the six identifier columns, so the 1941-column list is never hardcoded.
+Every other column stays fixed per output row; `d` and `units` become the
+new name/value pair.
+
+**Q: How did you handle the leading zero-runs before an item's first
+sale?**
+A: Computed `first_sale_date = MIN(date) WHERE units > 0` per series, then
+dropped every row before that date for that series. Those zeros represent
+"not yet stocked," not "zero demand" — an item that launched in month 30 of
+a 65-month window shouldn't have its pre-launch silence modelled as
+demand history, and leaving it in would badly deflate the RMSSE scaling
+denominator (which is itself computed from in-sample variance).
+
+**Q: Why LEFT JOIN to prices instead of INNER JOIN, if you're going to drop
+the unstocked rows anyway?**
+A: Because dropping them via the join type makes "not yet stocked" and "a
+genuine missing price for some other reason" indistinguishable — both just
+disappear. Left-joining and trimming explicitly via `first_sale_date` means
+if a *mid-life* price row were ever missing (a real data quality issue,
+distinct from pre-launch), it would surface as a `NULL` in `sell_price`
+after the trim, and the sanity check that counts null prices post-trim
+would catch it instead of silently losing the row.
+
+**Q: `wm_yr_wk` is a weekly key but sales are daily — walk me through that
+join.**
+A: Prices are one row per `(store_id, item_id, wm_yr_wk)` — a single price
+per store-item per week. Joining that onto daily sales via `wm_yr_wk`
+means every day within the same week gets the same price row; a "price
+change" in this dataset can only happen on a week boundary, not on an
+arbitrary weekday. That matters later for the promo definition in M6 — a
+promo onset is necessarily a week-level event, not a day-level one, because
+that's the grain at which price actually varies in this data.
+
+**Q: The spec says the date range should end 2016-06-19, but yours ends
+2016-05-22 — why the mismatch?**
+A: `sales_train_evaluation.csv` only has sales columns through `d_1941`,
+which maps to 2016-05-22. `calendar.csv` extends 28 days further, through
+`d_1969` / 2016-06-19, because those extra days are the actual 28-day
+forecast horizon — they carry calendar/price/SNAP features to predict
+*against*, not additional sales history. There's no ground truth for
+`d_1942`…`d_1969` in this file at all. `sales_long` correctly stops where
+the sales data stops; the spec's DoD text conflated the calendar table's
+range with the sales table's range.
+
+---

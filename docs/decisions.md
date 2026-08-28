@@ -24,3 +24,20 @@ All counts match the expected values in MILESTONES.md M0 exactly.
 `sales_train_validation.csv` (stops at d_1913) was deleted from data/raw/ per
 spec — this project uses only `sales_train_evaluation.csv` (through d_1941),
 and keeping both invites loading the wrong one by mistake.
+
+## 2026-08-28 — Entry 2: DuckDB warehouse (M1)
+
+Built `sales_long` via DuckDB `UNPIVOT ... ON COLUMNS(* EXCLUDE (...))`
+rather than a generated UNION ALL, scoped inline to the configured
+stores/depts, LEFT JOINed to prices, with pre-launch zero-runs trimmed via
+an explicit `first_sale_date` per series (not via join semantics). Full
+rebuild: 95s, 4,065 distinct series, zero null prices post-trim.
+
+Spec note: MILESTONES.md's M1 DoD says the date range should end
+2016-06-19; `sales_long` correctly ends 2016-05-22 (the last date with
+actual sales in `sales_train_evaluation.csv` / `d_1941`). The extra 28 days
+in `calendar.csv` (through `d_1969`) are the forecast horizon itself —
+calendar/price/SNAP features to predict against, with no sales ground
+truth — not additional training history. Did not force a match; the spec
+text conflated the calendar table's range with the sales table's range.
+See `docs/build_journal.md` M1 section for the full reasoning.
