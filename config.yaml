@@ -5,6 +5,7 @@ depts: [FOODS_3, HOUSEHOLD_1]
 horizon: 28
 train_days: 730
 backtest_origins: [1857, 1885, 1913]
+anchor_stride_days: 14
 costs:
   margin_rate: 0.25
   holding_rate: 0.10

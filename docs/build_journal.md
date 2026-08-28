@@ -892,3 +892,270 @@ that's itself a finding worth reporting, not something a single split
 could ever surface.
 
 ---
+
+## M4 — LightGBM global model
+
+### What was built
+
+- `src/shelfsense/model.py` — `build_training_matrix` (direct multi-horizon
+  training matrix built entirely in DuckDB), `train`/`predict` wrapping
+  LightGBM with categorical handling and objective-specific params
+- `src/shelfsense/lgbm_backtest.py` — the 8-config hyperparameter grid
+  (early-stopped on fold 1), objective comparison, 3-fold backtest, and
+  `save_final_model`
+- `config.yaml` gained `anchor_stride_days` — a genuinely new parameter,
+  not in the original spec, added mid-milestone after hitting a hardware
+  memory ceiling (see below)
+- `models/lgbm_tweedie_final.txt` — the saved model artifact (gitignored,
+  a build output like the DuckDB file, not source)
+
+### Design: direct multi-horizon from the existing SQL feature layer
+
+The spec asked for "direct multi-horizon... train one model that predicts
+units at any offset within the 28-day window, with days_ahead as a
+feature," but didn't fully specify how to construct that target set from
+a `feature_matrix` that was built with one fixed t-28 shift per row. I
+confirmed the approach with the user before building rather than guessing:
+
+Every anchor row in `feature_matrix` at date `t` already carries features
+known at `t-28` (the SQL layer's leakage shift). Reusing that same anchor,
+for `days_ahead = k` in `[1, 28]`, gives a training example that predicts
+`units` at `(t - 28) + k` using features known at `t - 28` — exactly the
+situation of "today is `t-28`, forecast `k` days ahead." This means the
+*entire* multi-horizon target set for one anchor comes from one shifted
+feature row, with no need to build 28 separate feature tables at 28
+different shift amounts.
+
+```sql
+WITH anchors AS (
+    SELECT * FROM feature_matrix
+    WHERE date BETWEEN $train_start AND $origin_date
+      AND roll_mean_28 IS NOT NULL
+      AND DATE_DIFF('day', date, $origin_date::DATE) % $stride = 0
+),
+horizons AS (
+    SELECT UNNEST(generate_series(1, $horizon)) AS days_ahead
+)
+SELECT
+    a.* EXCLUDE (date, units),
+    h.days_ahead,
+    a.date + CAST(h.days_ahead - $horizon AS INTEGER) AS target_date,
+    t.units AS target_units
+FROM anchors a
+CROSS JOIN horizons h
+JOIN feature_matrix t
+    ON t.id = a.id
+   AND t.date = a.date + CAST(h.days_ahead - $horizon AS INTEGER)
+```
+
+### A hardware constraint that changed the design mid-build
+
+Every calendar day as an anchor produces ~80M rows per fold (730 anchor
+days x 4,065 series x 28 horizons) before the training row count. That's
+too large for this machine (16GB RAM) to convert to pandas and train
+LightGBM on repeatedly across 3 folds x 8 hyperparameter configs. I
+surfaced this to the user with the actual row-count math rather than
+silently shrinking the dataset, and we agreed on subsampling anchor dates
+to every 14th calendar day (`anchor_stride_days` in config.yaml) — still
+covering the full 2-year window and every season/weekday, at ~5.7M
+rows/fold instead of ~80M. This is a config-driven parameter, not a
+hardcoded shortcut: on different hardware, someone could set it back to 1
+and use every day.
+
+### A real memory bug, found and fixed (the M9 "what went wrong" answer)
+
+The first full run of the 8-config tuning grid was killed after climbing
+to **54GB of memory** with zero output. Diagnosis: `lgb.Dataset(...,
+free_raw_data=False)` explicitly keeps LightGBM's internal copy of the
+raw pandas data alive after the Dataset is built (normally it's freed once
+LightGBM has its own binary representation), and the tuning loop called
+`tr_split.copy()` / `va_split.copy()` fresh on every one of 8 iterations
+with no `del` or `gc.collect()` between them — so multiple ~10M-row
+DataFrame copies plus 8 retained raw-data Datasets accumulated across the
+loop instead of being released. Fixed two ways: switched to
+`free_raw_data=True` (the default; nothing in this codebase reuses a
+Dataset after training, so there's no reason to pay for keeping it) and
+added explicit `del model, preds; gc.collect()` after each grid iteration
+and each backtest fold. Verified the fix by watching actual process memory
+(via `tasklist`) on a single-config test before re-running the full grid.
+
+### Code
+
+The hand-specified 8-config grid and per-config scoring:
+```python
+GRID = [
+    {"num_leaves": nl, "learning_rate": lr, "min_data_in_leaf": mdl}
+    for nl, lr, mdl in itertools.product([64, 128, 256], [0.05, 0.1], [50, 200])
+][:8]
+
+def tune_on_fold1(config, objective="tweedie"):
+    ...
+    results = []
+    for params in GRID:
+        model = train(tr_split.copy(), objective=objective, seed=config.seed,
+                       valid_df=va_split.copy(), **params)
+        preds = predict(model, test_df)
+        scores = score_predictions(test_df, preds, train_units, weights)
+        scores.update(params)
+        results.append(scores)
+        del model, preds
+        gc.collect()
+    ...
+```
+
+`model.py`'s objective-specific LightGBM params:
+```python
+params = {
+    "objective": objective,
+    "num_leaves": num_leaves,
+    "learning_rate": learning_rate,
+    "min_data_in_leaf": min_data_in_leaf,
+    "seed": seed,
+    "deterministic": True,
+    "verbose": -1,
+}
+if objective == "tweedie":
+    params["tweedie_variance_power"] = 1.1
+if objective == "quantile":
+    params["alpha"] = quantile_alpha
+```
+
+### Verification result
+
+```
+Hyperparameter grid (8 configs, fold 1, early-stopped): best=0.8329 (num_leaves=128,
+  learning_rate=0.05, min_data_in_leaf=50), worst=0.8356. Gap: 0.33%.
+
+Objective comparison (fold 1, best hyperparameters):
+  l2:       0.8275
+  tweedie:  0.8279  <- selected (theoretical fit to the data, not because it won here)
+  poisson:  0.8322
+
+3-fold backtest, final model (tweedie, tuned hyperparameters):
+  d_1857: weighted RMSSE 0.794, MAE 1.566, bias -0.025
+  d_1885: weighted RMSSE 0.792, MAE 1.571, bias +0.007
+  d_1913: weighted RMSSE 0.769, MAE 1.536, bias +0.023
+  mean:   weighted RMSSE 0.785, MAE 1.557, bias +0.002
+
+vs seasonal_naive_7 (1.084): 27.6% reduction (clears the spec's 15%+ target)
+vs mean_28 (0.829), the stronger baseline: 5.2% reduction
+
+Model artifact: models/lgbm_tweedie_final.txt, trained on fold-3 origin, seed=42
+```
+
+### Design decisions
+
+**Direct multi-horizon reuses one shifted feature row per anchor for all
+28 horizons, instead of building 28 separately-shifted feature tables.**
+Because `feature_matrix`'s per-row shift is already fixed at exactly
+t-28, and the training origin for `days_ahead=k` is always `target_date -
+k`, an anchor's features (known at `anchor_date - 28`) are valid for
+predicting *any* target date from `anchor_date - 27` through
+`anchor_date`. That's exactly the 28-day horizon window. This is what
+makes "one feature build, 28 horizons" possible without touching the SQL
+layer again — the leakage-safety already baked into `feature_matrix`
+transfers directly to the multi-horizon target construction.
+
+**Anchor date subsampling (`anchor_stride_days=14`) surfaced to the user
+as a hardware constraint, not silently absorbed.** The alternative — just
+quietly reducing scope further (fewer series, shorter train window) —
+would have been a bigger and less reversible change to what the project
+measures. Subsampling anchors is the smallest change that preserves the
+project's actual design (direct multi-horizon, full 2-year window, all
+4,065 series, all 28 horizons) while fitting the available hardware, and
+it's a config value someone could revert to 1 on a machine with more RAM.
+
+**`free_raw_data=True` instead of `False` for the LightGBM Dataset.**
+`free_raw_data=False` exists for workflows that continue training a
+Dataset later or need to inspect the raw data after construction — this
+codebase does neither; each `train()` call is a one-shot, so there's no
+reason to pay double memory for data that's immediately redundant once
+LightGBM's internal structure exists. This is a good general lesson: a
+parameter defaulting to `True` in a library usually exists because `False`
+is the exception, not the safe default, and reaching for `free_raw_data=
+False` without a specific reason to keep the data (which I didn't have)
+was the actual bug.
+
+**Tweedie kept as the production objective despite L2 scoring marginally
+better in the comparison.** Reporting the comparison honestly (L2 beat
+Tweedie by 0.05% on this slice) while still choosing Tweedie is not a
+contradiction: the choice of loss function should reflect the data
+distribution's actual shape (non-negative, zero-inflated, right-skewed),
+not chase a within-noise difference on one particular 3-store/2-dept slice
+of one particular dataset. A 0.05% gap is not evidence that L2 is the
+better modelling choice in general — it's evidence that the two are
+close enough here that hyperparameter tuning matters more than objective
+choice for this specific data.
+
+**Bias reported with its fold-to-fold sign flip stated explicitly, not
+averaged into a single "≈0" number and left there.** The mean bias across
+folds (+0.002) looks reassuringly neutral, but that number alone hides
+that the model under-forecasts on fold 1 and over-forecasts on folds 2-3.
+Averaging those to near-zero and stopping there would be technically true
+and substantively misleading — flagging the sign flip for M7's error
+segmentation is what keeps this an honest number rather than a
+convenient one.
+
+### Interview questions this milestone should prepare you for
+
+**Q: Why a global model instead of one model per series?**
+A: Two reasons. First, statistical: 4,000 individual models can't share
+the SNAP effect, the Thanksgiving effect, or any cross-series pattern —
+each one has to relearn it from that single series' history alone, which
+is especially weak for short-history items. A global model learns those
+effects once from all 4,065 series' worth of evidence and applies them
+everywhere. Second, practical: a global model handles a brand-new item
+with only a few weeks of history gracefully (it borrows structure from
+similar items via the categorical and price features), where a per-series
+model for that item would have almost nothing to train on.
+
+**Q: Why direct multi-horizon instead of recursive?**
+A: Recursive forecasting predicts day t+1, then feeds that prediction back
+in as a lagged feature to predict t+2, and so on for 28 steps — so any
+error in the day-1 prediction compounds through all 27 subsequent steps,
+and by day 28 the model may be conditioning on values that look nothing
+like real data. Direct multi-horizon trains one model to predict any
+offset within the horizon directly from features known at the origin, with
+`days_ahead` as a feature, so every prediction is made from real observed
+history, not from the model's own earlier guesses.
+
+**Q: Your baseline is close to your model on some segments — why keep the
+model?**
+A: I'd rather answer this with the real numbers than avoid it: LightGBM
+beats `mean_28`, the strongest baseline, by 5.2% on weighted RMSSE
+overall — a real but modest margin, much smaller than the 27.6% margin
+over `seasonal_naive_7`. The honest reason to keep the model isn't raw
+accuracy on average, it's that `mean_28` structurally cannot use price,
+calendar, SNAP, or event information — it has no way to react to a known
+upcoming holiday or a planned price change. Where that information
+matters (holiday weeks, promotional periods), the gap should be larger
+than the 5.2% aggregate suggests, which is exactly what M7's error
+segmentation by "event weeks vs normal weeks" is designed to check.
+
+**Q: Why Tweedie loss?**
+A: Retail unit demand is non-negative, often zero (especially for slower
+items), and right-skewed when it isn't zero — a Poisson-like shape but
+with more mass at exactly zero than Poisson alone predicts well. Tweedie
+with `variance_power` between 1 and 2 interpolates between Poisson
+(count-like) and Gamma (continuous, skewed) behavior, which matches that
+shape without needing a separate zero-inflation model. On this particular
+slice, plain L2 scored marginally better (0.05%) — I report that honestly
+rather than hiding it, but I still chose Tweedie because that comparison
+is within noise, and the distributional argument for Tweedie doesn't
+depend on winning by a specific margin on one slice.
+
+**Q: What went wrong during this milestone, and how did you diagnose it?**
+A: The first hyperparameter-tuning run climbed to 54GB of memory before I
+killed it — on a 16GB machine, that's not "slow," it's a real bug.
+I traced it to `lgb.Dataset(..., free_raw_data=False)` combined with
+`.copy()`-ing a ~10M-row training split fresh on every one of 8 grid
+iterations with no cleanup in between, so multiple full copies plus
+retained raw-data references accumulated across the loop instead of being
+released. I confirmed the diagnosis by watching actual process memory
+(`tasklist`) on a single isolated config before and after switching to
+`free_raw_data=True` and adding explicit `del` + `gc.collect()` — memory
+stayed bounded on the retest, and I only reran the full 8-config grid
+after verifying that on one config first, rather than re-running the
+expensive job blind and hoping.
+
+---

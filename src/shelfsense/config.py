@@ -29,6 +29,7 @@ class Config:
     horizon: int
     train_days: int
     backtest_origins: list[int]
+    anchor_stride_days: int
     costs: Costs
     promo: Promo
     seed: int
@@ -45,6 +46,7 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
         horizon=raw["horizon"],
         train_days=raw["train_days"],
         backtest_origins=raw["backtest_origins"],
+        anchor_stride_days=raw["anchor_stride_days"],
         costs=Costs(**raw["costs"]),
         promo=Promo(**raw["promo"]),
         seed=raw["seed"],

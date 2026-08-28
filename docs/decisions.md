@@ -101,3 +101,55 @@ Correctness note worth flagging: `seasonal_naive_7` is implemented as
 forecast horizon and would not be horizon-legal — at forecast time we only
 know data through `t-1`, so "same weekday last week" has to be measured
 from the most recent horizon-legal anchor (`t-28`), not from `t` itself.
+
+## 2026-08-28 — Entry 5: LightGBM global model (M4)
+
+Direct multi-horizon design: each anchor row in `feature_matrix` (features
+already known at t-28 by the SQL layer's leakage shift) is exploded into
+28 training examples, one per `days_ahead` in [1,28], predicting `units` at
+`anchor_date - 28 + days_ahead`. One global model, `days_ahead` as a
+feature, no recursive chaining. Confirmed with the user before building
+(the spec didn't fully specify how to construct the multi-horizon target
+from the existing SQL feature layer).
+
+Machine constraint discovered mid-build: with every calendar day used as
+an anchor, the exploded training matrix is ~80M rows per fold — far too
+large for this machine (16GB RAM, ~8.4GB free) to hold in pandas or train
+LightGBM on repeatedly across 3 folds x 8 hyperparameter configs. Added
+`anchor_stride_days` (=14) to config.yaml: anchors are subsampled to every
+14th calendar day within each fold's training window, still covering the
+full 2-year window and every season, cutting the matrix to ~5.7M rows/fold.
+
+Also hit and fixed a genuine memory bug during the first tuning-grid run:
+`lgb.Dataset(..., free_raw_data=False)` plus repeated `.copy()` calls
+across the 8-config loop, with no explicit cleanup between iterations, let
+memory grow unbounded — one run reached 54GB before being killed. Fixed by
+switching to `free_raw_data=True` (the default; nothing downstream reuses
+the Dataset after training) and adding explicit `del` + `gc.collect()`
+after each grid iteration and each backtest fold.
+
+Hyperparameter grid (8 configs, hand-specified per spec, early-stopped on
+fold 1 only): best config num_leaves=128, learning_rate=0.05,
+min_data_in_leaf=50, weighted RMSSE 0.8329; worst config 0.8356. Gap
+between best and worst: 0.33% — confirms the spec's expected finding that
+tuning budget beyond ~8 configs would not be worth spending.
+
+Objective comparison (fold 1, best hyperparameters): l2=0.8275,
+tweedie=0.8279, poisson=0.8322. Tweedie and l2 are statistically
+indistinguishable here (0.05% apart); reported honestly rather than
+switching to l2 to claim a marginally better number. Tweedie kept as the
+production objective on theoretical grounds (correct loss shape for
+non-negative, zero-inflated, right-skewed demand), not because it won this
+particular comparison outright.
+
+Full 3-fold backtest (final model): weighted RMSSE 0.794 / 0.792 / 0.769,
+mean 0.785. Improvement vs seasonal_naive_7 (1.084): 27.6% — clears the
+spec's 15%+ target. Improvement vs mean_28 (0.829), the stronger baseline:
+5.2% — a real but modest margin, honestly reported as smaller than the
+naive-baseline comparison would suggest. Bias averages +0.002 (neutral)
+but flips sign fold to fold — flagged for further investigation in M7,
+not smoothed over.
+
+Model artifact saved to `models/lgbm_tweedie_final.txt` (gitignored, like
+the DuckDB warehouse file — a build artifact, not source), trained on the
+fold-3 origin with the fixed seed from config.yaml.
