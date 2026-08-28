@@ -1,0 +1,14 @@
+data_dir: data/raw
+db_path: data/shelfsense.duckdb
+stores: [CA_3, TX_1, WI_2]
+depts: [FOODS_3, HOUSEHOLD_1]
+horizon: 28
+train_days: 730
+backtest_origins: [1857, 1885, 1913]
+costs:
+  margin_rate: 0.25
+  holding_rate: 0.10
+promo:
+  discount_threshold: 0.10
+  baseline_weeks: 8
+seed: 42

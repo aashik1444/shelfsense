@@ -1,0 +1,19 @@
+[project]
+name = "shelfsense"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb",
+    "pandas",
+    "numpy",
+    "lightgbm",
+    "scikit-learn",
+    "statsmodels",
+    "shap",
+    "matplotlib",
+    "pyyaml",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
