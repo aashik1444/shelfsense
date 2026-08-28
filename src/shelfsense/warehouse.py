@@ -13,6 +13,9 @@ SQL_DIR = Path(__file__).resolve().parents[2] / "sql"
 SQL_FILES = [
     "01_load_raw.sql",
     "02_sales_long.sql",
+    "03_calendar_features.sql",
+    "04_price_features.sql",
+    "05_feature_matrix.sql",
 ]
 
 

@@ -449,3 +449,240 @@ the sales data stops; the spec's DoD text conflated the calendar table's
 range with the sales table's range.
 
 ---
+
+## M2 — SQL feature layer
+
+### What was built
+
+- `sql/03_calendar_features.sql` — day-of-week, month, week-of-year,
+  weekend flag, SNAP-eligibility-adjacent event calendar (`event_type_1`,
+  `days_to_next_event`, `days_since_last_event`), and an explicit
+  `is_christmas` flag
+- `sql/04_price_features.sql` — `sell_price` and everything derived from
+  it: trailing 8-week median ratio, dept-week median ratio, price-change
+  flag, 4-week price momentum
+- `sql/05_feature_matrix.sql` — the leakage-critical file: all lag and
+  rolling features on `units`, built with offset window frames so the
+  shift is structural, not a post-hoc `.shift(28)` a future edit could
+  accidentally remove
+- `tests/test_leakage.py` — six tests that independently reconstruct every
+  lag/rolling feature from `sales_long` in pandas and assert exact
+  agreement with `feature_matrix`, including one adversarial test that
+  checks the value does *not* match what the leaky (unshifted) window
+  would have produced
+
+### Code
+
+The leakage-critical core of `sql/05_feature_matrix.sql`:
+```sql
+-- ============================================================================
+-- LEAKAGE RULE
+--
+-- You are forecasting 28 days ahead. On the forecast date t, you know sales
+-- up to t-1 only. Therefore every lag and rolling feature must be shifted by
+-- at least h=28. Price, calendar, SNAP and event features are *plans*, known
+-- in advance, and may be used at time t directly.
+--
+-- The shift is implemented via the window FRAME clause, not by lagging then
+-- rolling. The frame's upper bound (28 PRECEDING) *is* the shift.
+-- ============================================================================
+
+LAG(units, 28) OVER (PARTITION BY id ORDER BY date) AS lag_28,
+
+AVG(units) OVER (
+    PARTITION BY id ORDER BY date ROWS BETWEEN 55 PRECEDING AND 28 PRECEDING
+) AS roll_mean_28,
+
+STDDEV(units) OVER (
+    PARTITION BY id ORDER BY date ROWS BETWEEN 55 PRECEDING AND 28 PRECEDING
+) AS roll_std_28,
+```
+
+The zero-run-length feature (current zero-run as of `t-28`), which needed
+the gap-and-islands technique plus a shift, not a plain window frame:
+```sql
+zero_run_calc AS (
+    SELECT
+        id, date, units,
+        ROW_NUMBER() OVER (PARTITION BY id ORDER BY date)
+            - ROW_NUMBER() OVER (
+                PARTITION BY id, (CASE WHEN units = 0 THEN 0 ELSE 1 END)
+                ORDER BY date
+              ) AS zero_run_group
+    FROM sales_long
+),
+zero_run_length AS (
+    SELECT
+        id, date, units,
+        CASE
+            WHEN units = 0
+            THEN COUNT(*) OVER (PARTITION BY id, zero_run_group ORDER BY date
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+            ELSE 0
+        END AS zero_run_length_asof_t
+    FROM zero_run_calc
+),
+zero_run_shifted AS (
+    SELECT
+        id, date,
+        LAG(zero_run_length_asof_t, 28) OVER (PARTITION BY id ORDER BY date) AS zero_run_length
+    FROM zero_run_length
+)
+```
+
+`tests/test_leakage.py` — the adversarial reconstruction test:
+```python
+def test_rolling_mean_reconstructs_from_raw_with_correct_shift(con, sample_rows):
+    """roll_mean_28 must equal the mean of units over the 28-day window
+    ending at t-28 -- i.e. dates [t-55, t-28] inclusive -- and must NOT
+    equal the same window computed without the shift (dates [t-27, t]),
+    which would be the leaky version."""
+    for _, row in sample_rows.iterrows():
+        raw = _raw_series(con, row["id"])
+        t = pd.Timestamp(row["date"])
+
+        window_start = t - pd.Timedelta(days=55)
+        window_end = t - pd.Timedelta(days=28)
+        correct_window = raw.loc[window_start:window_end]
+        expected = correct_window.mean()
+        actual = row["roll_mean_28"]
+        assert np.isclose(actual, expected, atol=1e-6)
+
+        # the leaky alternative: window ending at t instead of t-28
+        leaky_window = raw.loc[t - pd.Timedelta(days=27) : t]
+        if len(leaky_window) > 0:
+            leaky_value = leaky_window.mean()
+            if not np.isclose(leaky_value, expected, atol=1e-6):
+                assert not np.isclose(actual, leaky_value, atol=1e-6), (
+                    "roll_mean_28 matches the LEAKY (unshifted) window"
+                )
+```
+
+### Verification result
+
+```
+feature_matrix build time: 35s (from sales_long); full warehouse rebuild: ~138s end-to-end
+row count: 6,166,395 (== sales_long row count, confirming no fanout from the feature joins)
+
+tests/test_leakage.py: 6 passed
+  test_lag_features_reconstruct_from_raw
+  test_lag_364_reconstructs_from_raw
+  test_rolling_mean_reconstructs_from_raw_with_correct_shift
+  test_rolling_std_reconstructs_from_raw
+  test_roll_max_28_reconstructs_from_raw
+  test_no_feature_uses_data_after_t_minus_28
+
+null rates (all expected):
+  lag_28 / roll_mean_* / roll_std_* / roll_max_28 / zero_run_length: 1.85-1.91% (first 28 days of each series)
+  lag_364: 23.95% (series younger than a year)
+  event_type_1: 91.88% (most days have no event -- correct)
+  price_vs_item_median_8w / price_changed_flag / sell_price: 0% (price exists for every post-trim row)
+```
+
+### Design decisions
+
+**Shift via the window frame clause, not `LAG` then `.rolling()`.** Framing
+`ROWS BETWEEN 55 PRECEDING AND 28 PRECEDING` makes the shift a structural
+property of the frame boundary — there is no intermediate "unshifted
+rolling column" that a later refactor could accidentally leave unlagged.
+The rejected two-step alternative (compute a normal trailing rolling
+feature, then `.shift(28)` the whole column) is functionally identical
+when done correctly, but it's one dropped `.shift()` call away from silent
+leakage with no error thrown — the column still populates, the model still
+trains, the leak only shows up as suspiciously good backtest numbers that
+collapse in production. Since this is the failure mode the whole project
+treats as non-negotiable (constraint #4), the frame-clause version is not
+just tidier, it's structurally harder to get wrong.
+
+**`roll_mean_7` implemented as `ROWS BETWEEN 34 PRECEDING AND 28 PRECEDING`,
+not `6 PRECEDING AND 0 PRECEDING` then shifted.** The window width (7 rows)
+is `34 - 28 + 1 = 7`; both bounds already encode the h=28 shift, so there's
+one fewer moving part than a separate "width" and "shift" parameter that
+have to agree with each other by convention rather than by construction.
+
+**Zero-run length computed with gap-and-islands, then explicitly
+`LAG(..., 28)`-ed as a separate step, rather than folded into one window
+expression.** A run-length calculation is inherently sequential (it depends
+on the running state of the *previous* row within the same zero/nonzero
+run), which a single `ROWS BETWEEN a PRECEDING AND b PRECEDING` frame
+cannot express — the frame clause only shifts a fixed window, it can't
+compute a stateful running count and then also apply a lag in one
+expression without DuckDB re-deriving the run boundary at every row of the
+window, which is not how frame aggregates work. Splitting it into "compute
+the run length as it stands at each row" then "shift that whole column by
+28" is the correct decomposition: the run-length CTE has no leakage risk
+by itself (it's describing history up to and including the current row),
+and the leakage-relevant shift is isolated to one explicit, auditable
+`LAG(zero_run_length_asof_t, 28)` call.
+
+**`price_vs_dept_median_week` uses `PARTITION BY dept_id, store_id,
+wm_yr_wk` with no `ORDER BY`/frame — a whole-partition aggregate, not a
+running window.** This is intentional: the feature answers "how does this
+item's price compare to the dept's median price *this week*," which is a
+property of the whole week, not a running-as-of-this-row calculation. Since
+`wm_yr_wk` is itself a *plan* (known in advance, per the M1 gotcha), the
+partition-wide aggregate needs no leakage shift — it's not looking at
+future sales, only at prices that are already set.
+
+**Adding a test that explicitly checks the leaky-window value does NOT
+match, not just that the correct-window value does.** A test that only
+asserts `actual == expected(correct_window)` can pass by coincidence if the
+correct and leaky windows happen to have similar means (which they often do
+for slow-moving series). Testing the negative — the value should differ
+from what the leaky version would have produced, whenever those two windows
+actually diverge — is what actually distinguishes "the shift is correctly
+implemented" from "the SQL happened to produce a number in the right
+ballpark."
+
+### Interview questions this milestone should prepare you for
+
+**Q: Write me a window function that computes a 28-day trailing average
+lagged by 28 days.**
+A:
+```sql
+AVG(units) OVER (
+    PARTITION BY id
+    ORDER BY date
+    ROWS BETWEEN 55 PRECEDING AND 28 PRECEDING
+)
+```
+The frame spans 28 rows (`55 - 28 + 1`), and its most recent visible row is
+28 rows before the current one — so at forecast time t, the average never
+includes anything from `t-27` through `t`. The shift is the frame's upper
+bound, not a separate operation applied afterward.
+
+**Q: How do you know you didn't leak?**
+A: Two independent checks, not one. First, structurally: every lag/rolling
+feature is built with a window frame whose upper bound is `28 PRECEDING`,
+so leakage would require the frame clause itself to be wrong, not a
+downstream step to be forgotten. Second, empirically: `test_leakage.py`
+recomputes the same features from raw `sales_long` in pandas, completely
+independently of the SQL, for a 200-row sample, and asserts exact
+agreement — including a test that the value does *not* match what the
+unshifted window would have produced. If the SQL leaked, that reconstruction
+would catch it on real data, not on a synthetic fixture built to already
+agree with the code under test.
+
+**Q: Why build the zero-run-length feature in two steps (gap-and-islands,
+then a separate LAG) instead of one window expression?**
+A: Run length is a running/stateful calculation — how many consecutive
+zero-days precede this row — which a fixed `ROWS BETWEEN a PRECEDING AND b
+PRECEDING` frame can't express in a single pass, because that frame only
+shifts a static window, it doesn't accumulate state across rows. So the
+correct approach is to compute the run length "as of each row" (no leakage
+risk, since it only describes history up to that row) and then apply the
+h=28 shift to that whole column as an explicit, separate `LAG` call —
+splitting the sequential-state problem from the leakage-shift problem
+rather than trying to solve both in one expression.
+
+**Q: `lag_364` is null for a lot of rows — why not fill it with something?**
+A: It's null because the series hasn't existed for a year yet — there's no
+"same day last year" value to reference for an item still in its first 12
+months. Filling it with 0 would be actively wrong: 0 is a real, meaningful
+demand value in this dataset (a lot of days genuinely have zero units
+sold), so imputing a missing value with a real value destroys the
+distinction between "we don't know" and "we know it was zero." LightGBM
+handles missing values natively by learning a default split direction for
+them, so leaving it null is both more honest and requires no extra code.
+
+---
