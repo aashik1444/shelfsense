@@ -153,3 +153,50 @@ not smoothed over.
 Model artifact saved to `models/lgbm_tweedie_final.txt` (gitignored, like
 the DuckDB warehouse file — a build artifact, not source), trained on the
 fold-3 origin with the fixed seed from config.yaml.
+
+## 2026-08-29 — Entry 6: Scope frozen at M4
+
+Scope is closed. M5 (cost-of-error/newsvendor), M6 (promotional uplift —
+DiD, event study, power analysis), M7 (SHAP/error segmentation), M8
+(write-up/README as originally scoped), and M9 (interview drill sheet as
+originally scoped) will not be built. This entry, the README rewrite, and
+`docs/interview_drill.md` are the closure documentation for what already
+exists, not a partial start on the remaining milestones.
+
+**What was built (M0-M4, complete and tested):** data verification and
+config scaffolding; a DuckDB warehouse (`sales_long`) built from a wide-to-
+long unpivot with scope filtering, calendar/price joins, and first-sale
+trimming; a SQL feature layer (`feature_matrix`) with every lag/rolling
+feature shifted via window FRAME clauses and independently leakage-tested;
+a metrics/baseline/rolling-origin backtest harness; and a global LightGBM
+model with direct multi-horizon training, a hand-tuned 8-config grid, an
+honest Tweedie/Poisson/L2 objective comparison, and a 3-fold backtest. 17
+tests pass across `test_leakage.py`, `test_metrics.py`, and `test_splits.py`.
+
+**What exists but is NOT part of the frozen scope:** `src/shelfsense/cost.py`
+and `src/shelfsense/plots.py` were written as the start of M5 before the
+freeze decision. They are unintegrated — no pipeline output depends on
+them, they are not covered by any test, and their numbers (if any were
+computed) were not verified against the full 3-fold backtest before work
+stopped. They should be treated as scaffolding, not as a partial M5
+result, and are called out explicitly in the README's "what I'd do next"
+section rather than presented as completed work.
+
+**Why this stopping point is defensible, not just convenient:** the SQL
+feature-engineering layer, the leakage-safety proof (both the structural
+window-frame design and the independent pandas reconstruction test), the
+validation harness (rolling-origin, not a single split, with the RMSSE
+denominator scoped correctly per fold), and the modelling loop (baseline
+comparison → hyperparameter tuning → objective comparison → final
+backtest, each step logged) form one complete, internally consistent
+unit — every claim in it is backed by a real number computed from the
+actual data, and every design choice has a stated, defensible reason. The
+remaining milestones (uplift, SHAP, cost-of-error) are independent
+analysis extensions that consume the outputs of this pipeline; they are
+not gaps in the pipeline itself. A partially-built M5/M6 would have been
+worse than a clearly-scoped M4 stop: an unfinished cost-of-error number or
+an unfinished causal design is a half-claim that invites exactly the kind
+of "did you actually verify that" question this project is trying to
+avoid, whereas "I built and validated the forecasting half, and scoped
+the causal/interpretability half out deliberately" is a complete,
+honest answer.
